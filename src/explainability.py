@@ -1,89 +1,68 @@
-# src/explainability.py
-
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from model import TransformerAutoencoder
-from data_loader import get_data_loaders
-import config
 import os
 
-def visualize_attention():
-    """
-    Visualizes the attention weights for the first anomalous sequence found in the test set.
-    """
-    print("--- Running Explainability Module ---")
-    device = torch.device(config.DEVICE)
-    
-    # 1. Load a single sequence for analysis
-    _, test_loader, _ = get_data_loaders(batch_size=1) # Use batch size 1 to easily pick one sequence
-    if test_loader is None:
-        return
+import config
+from model import TransformerAutoencoder
 
-    # Find the first anomalous sequence
-    sample_sequence, sample_label = None, None
-    sequence_idx = -1
-    for i, (seq, lbl) in enumerate(test_loader):
-        if lbl.item() == 1: # 1 indicates DDoS/anomaly
-            sample_sequence = seq
-            sample_label = lbl
-            sequence_idx = i
-            break
-            
-    if sample_sequence is None:
-        print("No anomalous sequence found in the test set.")
-        return
-        
-    sample_sequence = sample_sequence.to(device)
+def analyze_anomaly_with_xai(model: TransformerAutoencoder, anomaly_sequence: np.ndarray):
+    """
+    Processes an anomalous sequence, visualizes the encoder's attention weights,
+    and saves the visualization as a heatmap. 
 
-    # 2. Load the trained model
-    model = TransformerAutoencoder(
-        input_dim=config.INPUT_DIM,
-        model_dim=config.MODEL_DIM,
-        nhead=config.NUM_HEADS,
-        num_encoder_layers=config.NUM_ENCODER_LAYERS,
-        num_decoder_layers=config.NUM_DECODER_LAYERS,
-        dim_feedforward=config.DIM_FEEDFORWARD
-    ).to(device)
-    
-    model_path = os.path.join(config.MODEL_PATH, config.MODEL_NAME)
-    try:
-        model.load_state_dict(torch.load(model_path, map_location=device))
-    except FileNotFoundError:
-        print(f"Error: Model file not found at {model_path}. Please run train.py first.")
-        return
-        
+    Args:
+        model (TransformerAutoencoder): The trained autoencoder model.
+        anomaly_sequence (np.ndarray): The single anomalous sequence to analyze.
+                                       Shape: (sequence_length, num_features)
+    """
     model.eval()
-
-    # 3. Get attention weights from the model
-    print(f"Fetching attention weights for anomalous sequence index {sequence_idx}...")
-    _, attention_weights = model(sample_sequence, return_attention=True)
     
-    if not attention_weights:
-        print("\n[Error] Could not retrieve attention weights. Ensure hooks are set up correctly in the model.")
+    # --- 1. Manually perform the initial steps of the forward pass ---
+    seq_tensor = torch.tensor(anomaly_sequence, dtype=torch.float32).unsqueeze(0).to(config.DEVICE)
+    
+    # Project input to model dimension, same as in the model's forward pass
+    src = model.input_projection(seq_tensor) * torch.sqrt(torch.tensor(model.model_dim, dtype=torch.float32))
+    # src has shape (N, L, E) = (1, 100, 128) because of batch_first=True in the model
+
+    # --- 2. Directly call the attention layer and request weights ---
+    # Get the first encoder layer
+    first_encoder_layer = model.transformer_encoder.layers[0]
+    
+    # The model's self-attention layer was initialized with `batch_first=True`,
+    # so it expects the input tensor in the shape (N, L, E).
+    # The previous permutation to (L, N, E) was incorrect and caused the shape error.
+    # We now pass the `src` tensor directly without permutation.
+    
+    # Call the self-attention block directly with need_weights=True
+    with torch.no_grad():
+        # The input `src` is already in the correct (N, L, E) format.
+        _, attn_weights = first_encoder_layer.self_attn(src, src, src, need_weights=True)
+    
+    if attn_weights is None:
+        print("Error: Could not retrieve attention weights.")
         return
+
+    # --- 3. Process and Visualize the Captured Weights ---
+    # The weights now correctly have the shape: (N, L, S) = (1, 100, 100).
     
-    # 4. Plot the attention maps
-    if not os.path.exists(config.ATTENTION_MAP_DIR):
-        os.makedirs(config.ATTENTION_MAP_DIR)
+    # Squeeze the batch dimension to get the correct 2D (100, 100) heatmap.
+    attention_map = attn_weights.squeeze(0).cpu().numpy()
 
-    for i, att_map in enumerate(attention_weights):
-        # att_map shape is (batch_size, num_heads, seq_len, seq_len)
-        # We average across all heads for visualization.
-        att_map = att_map.squeeze(0).mean(dim=0).cpu().detach().numpy()
+    # Final check on the shape to prevent plotting errors.
+    if attention_map.ndim != 2 or attention_map.shape[0] != attention_map.shape[1]:
+        print(f"Error: Final attention map has incorrect shape: {attention_map.shape}. Expected a square 2D matrix.")
+        return
 
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(att_map, cmap='viridis')
-        plt.title(f'Attention Map - Encoder Layer {i+1} for Sequence {sequence_idx}')
-        plt.xlabel('Key (Attended To)')
-        plt.ylabel('Query (Attending From)')
-        
-        save_path = os.path.join(config.ATTENTION_MAP_DIR, f'attention_map_layer_{i+1}_seq_{sequence_idx}.png')
-        plt.savefig(save_path)
-        plt.close()
-        print(f"Saved attention map for layer {i+1} to {save_path}")
-
-if __name__ == '__main__':
-    visualize_attention()
-
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(attention_map, cmap='viridis', xticklabels=False, yticklabels=False)
+    plt.title("Attention Heatmap for Anomalous Sequence", fontsize=16)
+    plt.xlabel("Key Positions (Time Steps)", fontsize=12)
+    plt.ylabel("Query Positions (Time Steps)", fontsize=12)
+    
+    os.makedirs(config.RESULTS_DIR, exist_ok=True)
+    save_path = os.path.join(config.RESULTS_DIR, 'attention_heatmap.png')
+    plt.savefig(save_path)
+    print(f"\nAttention heatmap for the detected anomaly saved to: {save_path}")
+    # plt.show() # Uncomment to display the plot directly
