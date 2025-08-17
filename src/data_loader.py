@@ -1,62 +1,77 @@
-# src/data_loader.py
-
-import torch
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
-from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
+from sklearn.preprocessing import StandardScaler
+import os
+from glob import glob
+from tqdm import tqdm
 import config
+from utils import create_sequences
 
-def create_sequences(data, seq_length):
-    """Converts a dataframe into sequences for the Transformer model."""
-    sequences = []
-    for i in range(len(data) - seq_length + 1):
-        sequences.append(data.iloc[i:i + seq_length].values)
-    return np.array(sequences)
-
-def get_data_loaders(batch_size=config.BATCH_SIZE):
+def load_and_preprocess_data():
     """
-    Loads, preprocesses, and prepares data loaders for training and testing.
+    Main function to orchestrate the data loading and preprocessing pipeline
+    as described in the interim report.
     """
-    # --- Training Data ---
-    try:
-        train_df = pd.read_csv(config.BENIGN_TRAFFIC_FILE)
-        # Drop non-numeric columns or identifiers if they exist
-        train_df = train_df.select_dtypes(include=np.number)
-    except FileNotFoundError:
-        print(f"Error: Training file not found at {config.BENIGN_TRAFFIC_FILE}. Please run a preprocessing script first.")
-        return None, None, None
-
-    # --- Feature Scaling ---
-    scaler = MinMaxScaler()
-    train_scaled = scaler.fit_transform(train_df)
-    train_scaled_df = pd.DataFrame(train_scaled, columns=train_df.columns)
-
-    # --- Create Sequences for Training ---
-    train_sequences = create_sequences(train_scaled_df, config.SEQUENCE_LENGTH)
-    train_dataset = TensorDataset(torch.from_numpy(train_sequences).float())
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-
-    # --- Testing Data (for evaluation) ---
-    try:
-        test_df = pd.read_csv(config.TEST_TRAFFIC_FILE)
-        test_labels_str = test_df['Label']
-        test_features = test_df.select_dtypes(include=np.number)
-    except FileNotFoundError:
-        print(f"Warning: Test file not found at {config.TEST_TRAFFIC_FILE}. Skipping test loader creation.")
-        return train_loader, None, scaler
-
-    # Use the *same* scaler from training data
-    test_scaled = scaler.transform(test_features)
-    test_scaled_df = pd.DataFrame(test_scaled, columns=test_features.columns)
-
-    test_sequences = create_sequences(test_scaled_df, config.SEQUENCE_LENGTH)
-    # Align labels with sequences. The first `seq_length - 1` labels are dropped.
-    test_sequence_labels = test_labels_str.iloc[config.SEQUENCE_LENGTH - 1:].apply(lambda x: 0 if 'BENIGN' in str(x).upper() else 1).values
-
-    test_dataset = TensorDataset(torch.from_numpy(test_sequences).float(), torch.from_numpy(test_sequence_labels).float())
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    os.makedirs(config.PROCESSED_DATA_DIR, exist_ok=True)
     
-    print("DataLoaders created successfully.")
-    return train_loader, test_loader, scaler
+    # Check if final processed file exists
+    benign_sequences_path = os.path.join(config.PROCESSED_DATA_DIR, 'X_benign_sequences.npy')
+    if os.path.exists(benign_sequences_path):
+        print(f"Preprocessed data found at {benign_sequences_path}. Loading...")
+        return np.load(benign_sequences_path)
 
+    # 1. Load and Concatenate CSV files
+    csv_files = glob(os.path.join(config.DATA_DIR, '*.csv'))
+    if not csv_files:
+        raise FileNotFoundError(f"No CSV files found in {config.DATA_DIR}. Please add the CIC-DDoS2019 dataset.")
+
+    df_list = [pd.read_csv(f) for f in tqdm(csv_files, desc="Loading CSVs")]
+    df = pd.concat(df_list, ignore_index=True)
+
+    # 2. Initial Cleaning
+    df.columns = df.columns.str.strip()
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.dropna(inplace=True)
+
+    # Drop non-numeric or unnecessary columns for this model
+    df = df.drop(columns=['Unnamed: 0', 'Flow ID', 'SimillarHTTP'], errors='ignore')
+    
+    # 3. Feature Engineering
+    # Hash-encode IP addresses
+    df['Source_IP_Hashed'] = df['Source IP'].apply(lambda x: hash(x))
+    df['Destination_IP_Hashed'] = df['Destination IP'].apply(lambda x: hash(x))
+
+    # Convert Timestamp to Time_Since_Start
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+    df['Time_Since_Start'] = (df['Timestamp'] - df['Timestamp'].min()).dt.total_seconds()
+    
+    # Drop original columns that have been engineered
+    df = df.drop(columns=['Source IP', 'Destination IP', 'Timestamp'])
+
+    # 4. Benign Data Isolation
+    benign_df = df[df['Label'] == 'BENIGN'].copy()
+    
+    # Keep only numerical features for the model
+    numerical_cols = benign_df.select_dtypes(include=np.number).columns.tolist()
+    benign_df = benign_df[numerical_cols]
+
+    print(f"Isolated {len(benign_df)} benign samples.")
+    print(f"Number of features before scaling: {len(benign_df.columns)}")
+
+    # 5. Final Scaling and Sequencing
+    scaler = StandardScaler()
+    benign_scaled = scaler.fit_transform(benign_df)
+    
+    # Create sequences
+    X_benign_sequences = create_sequences(benign_scaled, config.SEQUENCE_LENGTH)
+
+    print(f"Final training data shape: {X_benign_sequences.shape}") # Should be (56326, 100, 86) as per report
+    
+    # Save the processed data
+    np.save(benign_sequences_path, X_benign_sequences)
+    print(f"Processed benign sequences saved to {benign_sequences_path}")
+    
+    return X_benign_sequences
+
+if __name__ == '__main__':
+    load_and_preprocess_data()
