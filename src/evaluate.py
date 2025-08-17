@@ -1,105 +1,101 @@
-# src/evaluate.py
-
 import torch
 import torch.nn as nn
 import numpy as np
-from sklearn.metrics import precision_recall_fscore_support, accuracy_score, confusion_matrix
-import seaborn as sns
-import matplotlib.pyplot as plt
-from model import TransformerAutoencoder
-from data_loader import get_data_loaders
-import config
 import os
-import json
+from sklearn.metrics import classification_report
+from tqdm import tqdm
+
+import config
+from model import TransformerAutoencoder
+from data_loader import load_and_preprocess_data
+from explainability import analyze_anomaly_with_xai # Import the XAI function
 
 def evaluate_model():
-    """Evaluates the model on the test set and calculates classification metrics."""
-    device = torch.device(config.DEVICE)
+    """
+    Evaluates the model by finding a reconstruction threshold, classifying a test set,
+    and running the XAI module on the first detected anomaly.
+    """
+    # -- 1. Load Data to Determine Feature Count --
+    print("Loading data to determine model dimensions...")
+    X_benign = load_and_preprocess_data()
     
-    # 1. Load Data and Model
-    _, test_loader, _ = get_data_loaders()
-    if test_loader is None:
-        return
+    # Dynamically determine the number of features from the loaded data.
+    # This ensures the model architecture matches the saved checkpoint.
+    num_features = X_benign.shape[2]
+    print(f"Data loaded. Evaluating model with {num_features} features.")
 
+    # -- 2. Load Model --
+    print("Loading trained model...")
     model = TransformerAutoencoder(
-        input_dim=config.INPUT_DIM,
+        input_features=num_features, # Use the actual feature count
         model_dim=config.MODEL_DIM,
-        nhead=config.NUM_HEADS,
+        num_heads=config.NUM_HEADS,
         num_encoder_layers=config.NUM_ENCODER_LAYERS,
-        num_decoder_layers=config.NUM_DECODER_LAYERS,
-        dim_feedforward=config.DIM_FEEDFORWARD
-    ).to(device)
+        dim_feedforward=config.DIM_FEEDFORWARD,
+        dropout=config.DROPOUT
+    ).to(config.DEVICE)
     
-    model_path = os.path.join(config.MODEL_PATH, config.MODEL_NAME)
     try:
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.load_state_dict(torch.load(config.MODEL_SAVE_PATH, map_location=config.DEVICE))
     except FileNotFoundError:
-        print(f"Error: Model file not found at {model_path}. Please run train.py first.")
+        print(f"Model not found at {config.MODEL_SAVE_PATH}. Please run src/train.py first.")
         return
         
     model.eval()
 
-    # 2. Calculate Reconstruction Errors on Test Set
-    criterion = nn.MSELoss(reduction='none')
+    # -- 3. Determine Anomaly Threshold on Benign Data --
+    print("\nDetermining anomaly threshold using a validation set of benign data...")
+    # Use a subset of benign data as a validation set
+    validation_data = torch.tensor(X_benign[:5000], dtype=torch.float32)
+
     reconstruction_errors = []
-    actual_labels = []
-
-    print("--- Starting Evaluation ---")
     with torch.no_grad():
-        for sequences, labels in test_loader:
-            sequences = sequences.to(device)
-            reconstructed = model(sequences)
-            loss = criterion(reconstructed, sequences)
-            error_per_sequence = torch.mean(loss, dim=(1, 2))
-            reconstruction_errors.extend(error_per_sequence.cpu().numpy())
-            actual_labels.extend(labels.cpu().numpy())
-
-    # 3. Determine Anomaly Threshold
-    # This should ideally be done on a separate validation set of benign traffic.
-    # Here, we'll use a percentile of the errors from the test set for demonstration.
-    threshold = np.percentile(reconstruction_errors, 95)
-    print(f"Anomaly Threshold (95th percentile): {threshold:.6f}")
-
-    # 4. Classify and Evaluate
-    predicted_labels = [1 if e > threshold else 0 for e in reconstruction_errors]
+        for i in tqdm(range(len(validation_data)), desc="Calculating validation errors"):
+            seq = validation_data[i].unsqueeze(0).to(config.DEVICE)
+            reconstruction = model(seq)
+            error = nn.functional.mse_loss(reconstruction, seq).item()
+            reconstruction_errors.append(error)
     
-    precision, recall, f1, _ = precision_recall_fscore_support(actual_labels, predicted_labels, average='binary', zero_division=0)
-    accuracy = accuracy_score(actual_labels, predicted_labels)
+    # Set the threshold at the 99th percentile of errors on benign data
+    anomaly_threshold = np.percentile(reconstruction_errors, 99)
+    print(f"Anomaly Threshold (99th percentile): {anomaly_threshold:.6f}")
+
+    # -- 4. Evaluate on a Simulated Test Set --
+    print("\nEvaluating model on a simulated test set (benign + noisy data)...")
+    # Simulate an attack set by adding noise to the benign validation data
+    y_true = [0] * len(validation_data) # 0 for Benign
     
-    metrics = {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1_score': f1,
-        'anomaly_threshold': threshold
-    }
+    noise = np.random.normal(0, 0.5, validation_data.shape)
+    X_attack_simulated = validation_data.numpy() + noise
+    y_true.extend([1] * len(X_attack_simulated)) # 1 for Anomaly
     
-    print("\n--- Evaluation Metrics ---")
-    print(f"Accuracy:  {accuracy:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall:    {recall:.4f}")
-    print(f"F1-Score:  {f1:.4f}")
-    print("------------------------\n")
+    X_test = np.concatenate([validation_data.numpy(), X_attack_simulated])
+    
+    y_pred = []
+    first_anomaly_found = False
+    with torch.no_grad():
+        for i in tqdm(range(len(X_test)), desc="Classifying test data"):
+            seq_np = X_test[i]
+            seq = torch.tensor(seq_np, dtype=torch.float32).unsqueeze(0).to(config.DEVICE)
+            reconstruction = model(seq)
+            error = nn.functional.mse_loss(reconstruction, seq).item()
+            
+            is_anomaly = 1 if error > anomaly_threshold else 0
+            y_pred.append(is_anomaly)
+            
+            # --- XAI INTEGRATION ---
+            # If this is the first anomaly we've detected, run the explainability module
+            if is_anomaly and not first_anomaly_found:
+                print("\nFirst anomaly detected! Generating XAI attention heatmap...")
+                analyze_anomaly_with_xai(model, seq_np)
+                first_anomaly_found = True # Ensure we only do this once
 
-    # Save metrics to a file
-    if not os.path.exists(config.RESULTS_PATH):
-        os.makedirs(config.RESULTS_PATH)
-    with open(os.path.join(config.RESULTS_PATH, 'performance_metrics.json'), 'w') as f:
-        json.dump(metrics, f, indent=4)
-    print(f"Metrics saved to {config.RESULTS_PATH}performance_metrics.json")
+    if not first_anomaly_found:
+        print("\nNo anomalies were detected in the simulated test set.")
 
-    # Plot confusion matrix
-    cm = confusion_matrix(actual_labels, predicted_labels)
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Benign', 'DDoS'], yticklabels=['Benign', 'DDoS'])
-    plt.xlabel('Predicted')
-    plt.ylabel('Actual')
-    plt.title('Confusion Matrix')
-    cm_path = os.path.join(config.RESULTS_PATH, 'confusion_matrix.png')
-    plt.savefig(cm_path)
-    print(f"Confusion matrix saved to {cm_path}")
-    plt.show()
-
+    # -- 5. Print Classification Report --
+    print("\n--- Classification Report ---")
+    print(classification_report(y_true, y_pred, target_names=['Benign', 'Anomaly']))
 
 if __name__ == '__main__':
     evaluate_model()
