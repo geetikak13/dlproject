@@ -4,6 +4,7 @@ import torch
 DATA_DIR = "data/"
 PROCESSED_DATA_DIR = "data/processed/"
 MODEL_SAVE_PATH = "saved_models/transformer_autoencoder.pth"
+SCALER_SAVE_PATH = "saved_models/scaler.joblib"
 RESULTS_DIR = "results/"
 
 # -- Data Processing Parameters --
