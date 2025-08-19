@@ -8,41 +8,38 @@ import joblib
 import config
 from utils import create_sequences
 
-def get_combined_dataframe():
-    """Helper function to load and cache the combined dataframe."""
-    # Adjust path for notebook execution
+def get_benign_dataframe_from_csvs():
+    """
+    Reads all raw CSVs, filters for benign traffic, and returns a single
+    DataFrame. This is memory-intensive but only needs to be run once to create
+    the benign cache.
+    """
     if os.path.basename(os.getcwd()) == 'notebooks':
         base_path = '..'
     else:
         base_path = '.'
-        
-    feather_path = os.path.join(base_path, config.PROCESSED_DATA_DIR, 'combined_dataset.feather')
-    if os.path.exists(feather_path):
-        return pd.read_feather(feather_path)
-
+    
     csv_files = glob(os.path.join(base_path, config.DATA_DIR, '*.csv'))
     if not csv_files:
-        raise FileNotFoundError(f"No CSV files found in {os.path.join(base_path, config.DATA_DIR)}. Please add the CIC-DDoS2019 dataset.")
+        raise FileNotFoundError(f"No CSV files found in {os.path.join(base_path, config.DATA_DIR)}.")
 
-    df_list = [pd.read_csv(f) for f in tqdm(csv_files, desc="Loading CSVs")]
-    df = pd.concat(df_list, ignore_index=True)
-    
-    # Basic cleaning
-    df.columns = df.columns.str.strip()
-    df = df.drop(columns=['Unnamed: 0', 'Flow ID', 'SimillarHTTP'], errors='ignore')
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.dropna(inplace=True)
-    
-    # Feature Engineering
-    df['Source_IP_Hashed'] = df['Source IP'].apply(lambda x: hash(x))
-    df['Destination_IP_Hashed'] = df['Destination IP'].apply(lambda x: hash(x))
-    df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-    df['Time_Since_Start'] = (df['Timestamp'] - df['Timestamp'].min()).dt.total_seconds()
-    
-    # Save to feather for faster loading next time
-    os.makedirs(os.path.dirname(feather_path), exist_ok=True)
-    df.to_feather(feather_path)
-    return df
+    benign_chunks = []
+    for f in tqdm(csv_files, desc="Scanning CSVs for benign data"):
+        try:
+            if 'BENIGN' in pd.read_csv(f, usecols=[' Label'])[' Label'].unique():
+                full_chunk = pd.read_csv(f)
+                benign_part = full_chunk[full_chunk[' Label'] == 'BENIGN']
+                if not benign_part.empty:
+                    benign_chunks.append(benign_part)
+        except Exception as e:
+            print(f"Warning: Could not process file {f}. Error: {e}")
+            continue
+            
+    if not benign_chunks:
+        raise ValueError("No benign data found in any of the CSV files.")
+        
+    return pd.concat(benign_chunks, ignore_index=True)
+
 
 def load_and_preprocess_data():
     """Loads and preprocesses the BENIGN data for training."""
@@ -58,9 +55,18 @@ def load_and_preprocess_data():
         print(f"Preprocessed benign data and scaler found. Loading from cache...")
         return np.load(benign_sequences_path)
 
-    print("Cached data/scaler not found or incomplete. Running full preprocessing for benign data...")
-    df = get_combined_dataframe()
-    benign_df = df[df['Label'] == 'BENIGN'].copy()
+    print("Cached benign data/scaler not found. Processing from raw CSVs...")
+    benign_df = get_benign_dataframe_from_csvs()
+    
+    benign_df.columns = benign_df.columns.str.strip()
+    benign_df = benign_df.drop(columns=['Unnamed: 0', 'Flow ID', 'SimillarHTTP'], errors='ignore')
+    benign_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    benign_df.dropna(inplace=True)
+
+    benign_df['Source_IP_Hashed'] = benign_df['Source IP'].apply(lambda x: hash(x))
+    benign_df['Destination_IP_Hashed'] = benign_df['Destination IP'].apply(lambda x: hash(x))
+    benign_df['Timestamp'] = pd.to_datetime(benign_df['Timestamp'])
+    benign_df['Time_Since_Start'] = (benign_df['Timestamp'] - benign_df['Timestamp'].min()).dt.total_seconds()
     
     numerical_cols = benign_df.select_dtypes(include=np.number).columns.tolist()
     benign_df_numerical = benign_df[numerical_cols].copy()
@@ -78,53 +84,91 @@ def load_and_preprocess_data():
     
     return X_benign_sequences
 
-def load_and_preprocess_attack_data(attack_label: str):
-    """Loads and preprocesses a specific ATTACK data type for analysis."""
-    print(f"Loading and preprocessing data for attack type: {attack_label}")
+def create_and_cache_all_attack_sets(samples_per_type=100000):
+    """
+    Scans the raw CSVs and creates a separate, sampled .npy cache file for
+    each attack type found. Skips any attack type that fails.
+    """
+    print("Starting creation of individual attack sequence caches...")
     
-    if os.path.basename(os.getcwd()) == 'notebooks':
-        base_path = '..'
-    else:
-        base_path = '.'
-    
+    base_path = '.'
     scaler_path = os.path.join(base_path, config.SCALER_SAVE_PATH)
-    
+    csv_files = glob(os.path.join(base_path, config.DATA_DIR, '*.csv'))
+
+    if not csv_files:
+        raise FileNotFoundError("Raw CSV files not found.")
+
     try:
         scaler = joblib.load(scaler_path)
     except FileNotFoundError:
-        raise FileNotFoundError(f"Scaler not found at {scaler_path}. "
-                                "Please run the benign data preprocessing first by running `train.py` or `data_loader.py`.")
+        raise FileNotFoundError(f"Scaler not found at {scaler_path}. Run benign preprocessing first.")
 
-    df = get_combined_dataframe()
-    attack_df = df[df['Label'] == attack_label].copy()
-
-    if attack_df.empty:
-        raise ValueError(f"No data found for attack label '{attack_label}'. "
-                         f"Available labels include: {df['Label'].unique()}")
-
-    # --- Memory Optimization ---
-    # If the attack dataframe is very large, take a manageable sample to prevent memory errors.
-    # 50,000 is more than enough for a robust evaluation.
-    max_samples = 50000
-    if len(attack_df) > max_samples:
-        print(f"Attack dataset is very large ({len(attack_df)} rows). Taking a random sample of {max_samples} rows.")
-        attack_df = attack_df.sample(n=max_samples, random_state=42)
-
-    numerical_cols = attack_df.select_dtypes(include=np.number).columns.tolist()
-    attack_df_numerical = attack_df[numerical_cols].copy()
+    print("Determining all available attack labels...")
+    all_labels = set()
+    for f in tqdm(csv_files, desc="Scanning for labels"):
+        try:
+            all_labels.update(pd.read_csv(f, usecols=[' Label'])[' Label'].unique())
+        except Exception:
+            continue
     
-    scaler_features = scaler.feature_names_in_
-    attack_df_numerical = attack_df_numerical.reindex(columns=scaler_features, fill_value=0)
+    attack_labels = [label for label in all_labels if label != 'BENIGN']
+    print(f"Found {len(attack_labels)} attack types.")
 
-    attack_scaled = scaler.transform(attack_df_numerical)
-    
-    X_attack_sequences = create_sequences(attack_scaled, config.SEQUENCE_LENGTH)
-    
-    if X_attack_sequences.shape[0] == 0:
-        raise ValueError(f"Not enough data for '{attack_label}' to create a sequence of length {config.SEQUENCE_LENGTH}.")
+    for label in attack_labels:
+        output_path = os.path.join(base_path, config.PROCESSED_DATA_DIR, f'X_attack_{label}.npy')
+        if os.path.exists(output_path):
+            print(f"Cache for '{label}' already exists. Skipping.")
+            continue
+            
+        print(f"\nProcessing attack type: {label}")
+        try:
+            attack_samples_df_list = []
+            for f in tqdm(csv_files, desc=f"Reading '{label}'"):
+                try:
+                    for chunk_df in pd.read_csv(f, chunksize=100000, low_memory=False):
+                        attack_chunk = chunk_df[chunk_df[' Label'] == label]
+                        if not attack_chunk.empty:
+                            attack_samples_df_list.append(attack_chunk)
+                except Exception:
+                    continue
+            
+            if not attack_samples_df_list:
+                print(f"No samples found for {label}. Skipping.")
+                continue
+            
+            full_attack_df = pd.concat(attack_samples_df_list, ignore_index=True)
+            
+            if len(full_attack_df) > samples_per_type:
+                full_attack_df = full_attack_df.sample(n=samples_per_type, random_state=42)
 
-    print(f"Created {X_attack_sequences.shape[0]} sequences for '{attack_label}'.")
-    return X_attack_sequences
+            full_attack_df.columns = full_attack_df.columns.str.strip()
+            full_attack_df = full_attack_df.drop(columns=['Unnamed: 0', 'Flow ID', 'SimillarHTTP'], errors='ignore')
+            full_attack_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+            full_attack_df.dropna(inplace=True)
+            full_attack_df['Source_IP_Hashed'] = full_attack_df['Source IP'].apply(lambda x: hash(x))
+            full_attack_df['Destination_IP_Hashed'] = full_attack_df['Destination IP'].apply(lambda x: hash(x))
+            full_attack_df['Timestamp'] = pd.to_datetime(full_attack_df['Timestamp'])
+            full_attack_df['Time_Since_Start'] = (full_attack_df['Timestamp'] - pd.Timestamp.now()).dt.total_seconds()
+            
+            numerical_cols = full_attack_df.select_dtypes(include=np.number).columns.tolist()
+            df_numerical = full_attack_df[numerical_cols].copy()
+            df_numerical = df_numerical.reindex(columns=scaler.feature_names_in_, fill_value=0)
+            
+            scaled_data = scaler.transform(df_numerical)
+            sequences = create_sequences(scaled_data, config.SEQUENCE_LENGTH)
+            
+            if sequences.shape[0] > 0:
+                np.save(output_path, sequences)
+                print(f"Successfully created cache for {label} with {sequences.shape[0]} sequences.")
+            else:
+                print(f"Could not generate sequences for {label}.")
+
+        except Exception as e:
+            print(f"!!! FAILED to create cache for '{label}'. Error: {e}. Skipping. !!!")
+            continue
 
 if __name__ == '__main__':
+    print("--- Running Benign Data Preprocessing ---")
     load_and_preprocess_data()
+    print("\n--- Running Attack Data Caching ---")
+    create_and_cache_all_attack_sets()
