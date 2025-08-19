@@ -11,12 +11,13 @@ A key feature of this project is its **Explainable AI (XAI)** module, which gene
 ## 📁 Project Structure
 
 ```
-diproject/
+dlproject/
 │
 ├── data/                 # -> Place raw CIC-DDoS2019 .csv files here.
 │   └── processed/        # -> Stores the preprocessed, sequenced data (.npy file).
 │
 ├── notebooks/            # -> Jupyter notebooks for exploration and prototyping.
+│   ├── results/          # -> stores the attention heatmaps from notebook 03
 │   ├── 01_data_exploration.ipynb
 │   ├── 02_model_prototyping.ipynb
 │   └── 03_results_visualization.ipynb
@@ -88,7 +89,7 @@ pip install -r requirements.txt
 
 ### Step 4: Download the Dataset
 
-Download the CIC-DDoS2019 dataset from the link provided above. You will receive a set of `.csv` files. **Place all of these `.csv` files inside the `data/` directory** at the root of the project.
+Download the CIC-DDoS2019 dataset from the link provided above. You will receive a set of `.csv` files. **Place all of these `.csv` files inside the `data/` directory** at the root of the project. the csv files list is mentioned in the text file in data directory.
 
 -----
 
