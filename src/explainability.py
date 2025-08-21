@@ -1,5 +1,3 @@
-# src/explainability.py
-
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -39,7 +37,6 @@ def analyze_anomaly_with_xai(model: TransformerAutoencoder, anomaly_sequence: np
         return
 
     plt.figure(figsize=(12, 10))
-    # --- FIX: Add a numeric scale to the axes ---
     sns.heatmap(attention_map, cmap='viridis', xticklabels=10, yticklabels=10)
     plt.title(f"Attention Heatmap for Anomalous Sequence ({attack_type})", fontsize=16)
     plt.xlabel("Key Positions (Time Steps)", fontsize=12)
