@@ -1,3 +1,5 @@
+# src/explainability.py
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,11 +13,6 @@ def analyze_anomaly_with_xai(model: TransformerAutoencoder, anomaly_sequence: np
     """
     Processes an anomalous sequence, visualizes the encoder's attention weights,
     and saves the visualization as a uniquely named heatmap for the given attack type.
-
-    Args:
-        model (TransformerAutoencoder): The trained autoencoder model.
-        anomaly_sequence (np.ndarray): The single anomalous sequence to analyze.
-        attack_type (str): The name of the attack, used for the output filename.
     """
     model.eval()
     
@@ -42,15 +39,14 @@ def analyze_anomaly_with_xai(model: TransformerAutoencoder, anomaly_sequence: np
         return
 
     plt.figure(figsize=(12, 10))
-    sns.heatmap(attention_map, cmap='viridis', xticklabels=False, yticklabels=False)
+    # --- FIX: Add a numeric scale to the axes ---
+    sns.heatmap(attention_map, cmap='viridis', xticklabels=10, yticklabels=10)
     plt.title(f"Attention Heatmap for Anomalous Sequence ({attack_type})", fontsize=16)
     plt.xlabel("Key Positions (Time Steps)", fontsize=12)
     plt.ylabel("Query Positions (Time Steps)", fontsize=12)
     
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
-    # --- Create a unique filename for each attack type ---
     save_path = os.path.join(config.RESULTS_DIR, f'attention_heatmap_{attack_type}.png')
     plt.savefig(save_path)
-    # Close the plot to free up memory
     plt.close()
     print(f"\nAttention heatmap for '{attack_type}' saved to: {save_path}")

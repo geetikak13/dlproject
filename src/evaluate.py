@@ -1,8 +1,12 @@
+# src/evaluate.py
+
 import torch
 import torch.nn as nn
 import numpy as np
 import os
-from sklearn.metrics import classification_report, accuracy_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
 from tqdm import tqdm
 from torch.utils.data import DataLoader, TensorDataset
 from datetime import datetime
@@ -32,12 +36,55 @@ def get_predictions_in_batches(model, data, device, batch_size=256):
             
     return np.array(all_errors)
 
+def save_confusion_matrix_plot(y_true, y_pred, title, filename):
+    """Creates and saves a confusion matrix plot."""
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['Benign', 'Anomaly'], yticklabels=['Benign', 'Anomaly'])
+    plt.title(f'Confusion Matrix - {title}')
+    plt.ylabel('Actual Class')
+    plt.xlabel('Predicted Class')
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+
+def write_detailed_report(file_handle, title, y_true, y_pred):
+    """Writes a detailed section of the evaluation report and saves a confusion matrix plot."""
+    acc = accuracy_score(y_true, y_pred)
+    report_dict = classification_report(y_true, y_pred, target_names=['Benign', 'Anomaly'], output_dict=True)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+
+    # Save the plot
+    plot_filename = os.path.join(config.RESULTS_DIR, f"confusion_matrix_{title.replace(' ', '_')}.png")
+    save_confusion_matrix_plot(y_true, y_pred, title, plot_filename)
+
+    file_handle.write(f"\n--- {title} ---\n")
+    file_handle.write(f"Overall Accuracy: {acc * 100:.2f}%\n\n")
+    
+    file_handle.write("Confusion Matrix:\n")
+    file_handle.write(f"  - True Negatives (Benign as Benign): {tn}\n")
+    file_handle.write(f"  - False Positives (Benign as Anomaly): {fp}\n")
+    file_handle.write(f"  - False Negatives (Anomaly as Benign): {fn}\n")
+    file_handle.write(f"  - True Positives (Anomaly as Anomaly): {tp}\n")
+    file_handle.write(f"  (Visual diagram saved to: {os.path.basename(plot_filename)})\n\n")
+
+    file_handle.write("Metrics for 'Anomaly' class:\n")
+    precision = report_dict['Anomaly']['precision']
+    recall = report_dict['Anomaly']['recall']
+    f1_score = report_dict['Anomaly']['f1-score']
+    file_handle.write(f"  - Precision: {precision * 100:.2f}%\n")
+    file_handle.write(f"  - Recall: {recall * 100:.2f}%\n")
+    file_handle.write(f"  - F1-Score: {f1_score * 100:.2f}%\n\n")
+    
+    file_handle.write("Full Classification Report:\n")
+    file_handle.write(classification_report(y_true, y_pred, target_names=['Benign', 'Anomaly']))
+    file_handle.write("\n" + "="*50 + "\n")
+
 def evaluate_model():
     """
     Orchestrates the full evaluation process, using pre-cached data,
-    efficient batch inference, and exporting the final results to a file.
-    This version processes each attack file individually and saves a separate
-    heatmap for each.
+    efficient batch inference, and exporting a detailed final report.
     """
     # -- 1. Load Data and Model --
     print("Loading data and model...")
@@ -84,17 +131,9 @@ def evaluate_model():
     synth_errors = get_predictions_in_batches(model, X_test_synth, config.DEVICE)
     y_pred_synth = [1 if e > anomaly_threshold else 0 for e in synth_errors]
             
-    acc_synth = accuracy_score(y_true_synth, y_pred_synth)
-    report_synth = classification_report(y_true_synth, y_pred_synth, target_names=['Benign', 'Anomaly'])
-    
-    print(f"\nOverall Accuracy for Synthetic Data: {acc_synth * 100:.2f}%")
-    print(report_synth)
-    
     with open(report_path, 'a') as f:
-        f.write("\n--- Evaluation on Synthetic (Noisy) Data ---\n")
-        f.write(f"Overall Accuracy: {acc_synth * 100:.2f}%\n")
-        f.write(report_synth)
-        f.write("\n" + "="*50 + "\n")
+        write_detailed_report(f, "Synthetic Data", y_true_synth, y_pred_synth)
+    print("Synthetic data evaluation complete.")
 
     # -- 4. Evaluation on All Available Real Attack Data (One file at a time) --
     print("\n--- Evaluation on All Available Real Attack Data ---")
@@ -107,7 +146,6 @@ def evaluate_model():
     all_y_true = []
     all_y_pred = []
 
-    # Loop through each attack file individually
     for f_path in tqdm(attack_files, desc="Processing Attack Files"):
         attack_type = os.path.basename(f_path).replace('X_attack_', '').replace('.npy', '')
         tqdm.write(f"\nProcessing attack type: {attack_type}")
@@ -133,7 +171,6 @@ def evaluate_model():
         current_errors = get_predictions_in_batches(model, X_test_current, config.DEVICE)
         y_pred_current = [1 if e > anomaly_threshold else 0 for e in current_errors]
 
-        # Trigger XAI for the first anomaly found IN THIS FILE
         first_anomaly_index_in_file = next((i for i, pred in enumerate(y_pred_current) if pred == 1 and y_true_current[i] == 1), None)
         if first_anomaly_index_in_file is not None:
             analyze_anomaly_with_xai(model, X_test_current[first_anomaly_index_in_file], attack_type)
@@ -143,21 +180,15 @@ def evaluate_model():
 
     # -- 5. Final Aggregated Report --
     print("\n--- Aggregated Report for All Real Attack Data ---")
-    
-    acc_real = accuracy_score(all_y_true, all_y_pred)
-    report_real = classification_report(all_y_true, all_y_pred, target_names=['Benign', 'Anomaly'])
-    
-    print(f"Tested against {len(attack_files)} attack types.")
-    print(f"Overall Aggregated Accuracy: {acc_real * 100:.2f}%")
-    print(report_real)
-
     with open(report_path, 'a') as f:
-        f.write("\n--- Aggregated Report for All Real Attack Data ---\n")
-        f.write(f"Tested against {len(attack_files)} attack types.\n")
-        f.write(f"Overall Aggregated Accuracy: {acc_real * 100:.2f}%\n")
-        f.write(report_real)
+        write_detailed_report(f, f"Aggregated Real Attack Data", all_y_true, all_y_pred)
+    
+    final_acc = accuracy_score(all_y_true, all_y_pred)
+    final_report = classification_report(all_y_true, all_y_pred, target_names=['Benign', 'Anomaly'])
+    print(f"Overall Aggregated Accuracy: {final_acc * 100:.2f}%")
+    print(final_report)
 
-    print(f"\nEvaluation complete. Report saved to {report_path}")
+    print(f"\nEvaluation complete. Detailed report saved to {report_path}")
 
 if __name__ == '__main__':
     evaluate_model()
