@@ -4,7 +4,6 @@ from tqdm import tqdm
 def create_sequences(data: np.ndarray, sequence_length: int):
     """
     Creates overlapping sequences from the input data.
-    This function is based on the description of the final data shape in the report.
     """
     sequences = []
     data_len = len(data)
